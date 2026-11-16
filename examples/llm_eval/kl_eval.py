@@ -44,8 +44,15 @@ def spaced_positions(length, count):
 
 
 @torch.inference_mode()
-def mean_kl(reference_logits, quantized_logits, top_k=1024, chunk_size=32, position_counts=()):
-    """Return full and conditional top-k forward KL in nats; top_k=None skips the head metric."""
+def mean_kl(
+    reference_logits,
+    quantized_logits,
+    top_k=1024,
+    chunk_size=32,
+    position_counts=(),
+    full_vocab_kl=False,
+):
+    """Return conditional top-k forward KL in nats, optionally adding full-vocabulary KL."""
     if reference_logits.ndim != 2 or reference_logits.shape != quantized_logits.shape:
         raise ValueError("Expected matching [generated positions, vocabulary] logits.")
     num_tokens, vocab_size = reference_logits.shape
@@ -53,7 +60,13 @@ def mean_kl(reference_logits, quantized_logits, top_k=1024, chunk_size=32, posit
         raise ValueError("Require generated positions and a positive chunk size.")
     if top_k is not None and (not isinstance(top_k, int) or not 1 <= top_k <= vocab_size):
         raise ValueError("Require integer 1 <= top_k <= V when conditional KL is requested.")
-    names = ["full_vocab_kl"] + (["conditional_topk_kl"] if top_k is not None else [])
+    if not full_vocab_kl and (top_k is None or position_counts):
+        raise ValueError(
+            "Full-vocabulary KL requires full_vocab_kl=True; otherwise supply top_k only."
+        )
+    names = (["full_vocab_kl"] if full_vocab_kl else []) + (
+        ["conditional_topk_kl"] if top_k is not None else []
+    )
     if any(not isinstance(count, int) or count < 1 for count in position_counts):
         raise ValueError("Position counts must be positive integers.")
     per_position = []
@@ -63,11 +76,13 @@ def mean_kl(reference_logits, quantized_logits, top_k=1024, chunk_size=32, posit
         quantized = quantized_logits[start : start + chunk_size].to(
             device=reference.device, dtype=torch.float32
         )
-        log_p = F.log_softmax(reference, dim=-1)
-        log_q = F.log_softmax(quantized, dim=-1)
-        values = [F.kl_div(log_q, log_p, log_target=True, reduction="none").sum(-1)]
-        if position_counts:
-            per_position.append(values[0])
+        values = []
+        if full_vocab_kl:
+            log_p = F.log_softmax(reference, dim=-1)
+            log_q = F.log_softmax(quantized, dim=-1)
+            values.append(F.kl_div(log_q, log_p, log_target=True, reduction="none").sum(-1))
+            if position_counts:
+                per_position.append(values[0])
         if top_k is not None:
             # Both conditional distributions use the reference's token IDs, not rank slots.
             ids = reference.topk(top_k, dim=-1).indices
@@ -94,7 +109,14 @@ def mean_kl(reference_logits, quantized_logits, top_k=1024, chunk_size=32, posit
 
 @torch.inference_mode()
 def _score_batch(
-    reference, quantized, sequences, prompt_lengths, pad_token_id, top_k, position_counts=()
+    reference,
+    quantized,
+    sequences,
+    prompt_lengths,
+    pad_token_id,
+    top_k,
+    position_counts=(),
+    full_vocab_kl=False,
 ):
     generated_lengths = [
         len(sequence) - length for sequence, length in zip(sequences, prompt_lengths)
@@ -128,12 +150,21 @@ def _score_batch(
             [outputs.logits[i, -length:].clone() for i, length in enumerate(generated_lengths)]
         )
         del outputs
-    return [mean_kl(p, q, top_k, position_counts=position_counts) for p, q in zip(*scores)]
+    return [
+        mean_kl(p, q, top_k, position_counts=position_counts, full_vocab_kl=full_vocab_kl)
+        for p, q in zip(*scores)
+    ]
 
 
 @torch.inference_mode()
 def score_continuation(
-    reference, quantized, token_ids, prompt_tokens, top_k=1024, position_counts=()
+    reference,
+    quantized,
+    token_ids,
+    prompt_tokens,
+    top_k=1024,
+    position_counts=(),
+    full_vocab_kl=False,
 ):
     """Score only continuation predictions, including the first generated token and EOS."""
     if token_ids.ndim != 2 or token_ids.shape[0] != 1:
@@ -141,7 +172,14 @@ def score_continuation(
     if not 0 < prompt_tokens < token_ids.shape[1]:
         raise ValueError("Require a nonempty prompt and continuation.")
     return _score_batch(
-        reference, quantized, token_ids.cpu().tolist(), [prompt_tokens], 0, top_k, position_counts
+        reference,
+        quantized,
+        token_ids.cpu().tolist(),
+        [prompt_tokens],
+        0,
+        top_k,
+        position_counts,
+        full_vocab_kl=full_vocab_kl,
     )[0]
 
 
@@ -156,10 +194,15 @@ def evaluate(
     detailed_results=False,
     eval_batch_size=8,
     position_counts=(),
+    full_vocab_kl=False,
 ):
     """Generate and score shared continuations in batches, averaging prompt scores equally."""
     if not prompts or eval_batch_size < 1:
         raise ValueError("Require evaluation prompts and a positive evaluation batch size.")
+    if not full_vocab_kl and (top_k is None or position_counts):
+        raise ValueError(
+            "Full-vocabulary KL requires full_vocab_kl=True; otherwise supply top_k only."
+        )
     position_counts = tuple(dict.fromkeys(position_counts))
     if any(not isinstance(count, int) or count < 1 for count in position_counts):
         raise ValueError("Position counts must be positive integers.")
@@ -182,7 +225,7 @@ def evaluate(
         pad_token_id=pad_token_id,
         use_cache=True,
     )
-    totals = {"full_vocab_kl": 0.0}
+    totals = {"full_vocab_kl": 0.0} if full_vocab_kl else {}
     totals.update({f"spaced_full_vocab_kl_{count}": 0.0 for count in position_counts})
     if top_k is not None:
         totals["conditional_topk_kl"] = 0.0
@@ -221,7 +264,14 @@ def evaluate(
         del sequences
         histories = [prompt["input_ids"] + tokens for prompt, tokens in zip(batch, continuations)]
         metrics = _score_batch(
-            reference, quantized, histories, lengths, pad_token_id, top_k, position_counts
+            reference,
+            quantized,
+            histories,
+            lengths,
+            pad_token_id,
+            top_k,
+            position_counts,
+            full_vocab_kl=full_vocab_kl,
         )
         for index, (prompt, tokens, values) in enumerate(zip(batch, continuations, metrics), start):
             for name, value in values.items():
@@ -296,7 +346,10 @@ def _parse_args():
         "--top_k",
         type=int,
         default=1024,
-        help="Reference top tokens for conditional KL (default: 1024); full KL is always computed.",
+        help="Reference top tokens for conditional KL (default: 1024).",
+    )
+    parser.add_argument(
+        "--full_vocab_kl", action="store_true", help="Also compute full-vocabulary KL."
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -304,7 +357,7 @@ def _parse_args():
         nargs="+",
         type=int,
         default=[],
-        help="Also score evenly spaced positions over each complete continuation (e.g. 16 32 64 128).",
+        help="Full-vocabulary KL at evenly spaced positions; requires --full_vocab_kl.",
     )
     parser.add_argument("--output", type=Path, default=Path("kl_results.json"))
     parser.add_argument(
@@ -328,6 +381,8 @@ def _parse_args():
             parser.error(f"--{name} must be positive.")
     if args.top_k is not None and args.top_k < 1:
         parser.error("--top_k must be positive when supplied.")
+    if args.position_counts and not args.full_vocab_kl:
+        parser.error("--position_counts requires --full_vocab_kl.")
     if any(count < 1 for count in args.position_counts):
         parser.error("--position_counts must be positive.")
     if args.calib_seq is not None and args.calib_seq < 1:
@@ -419,6 +474,7 @@ def main():
             detailed_results=args.detailed_results,
             eval_batch_size=args.eval_batch_size,
             position_counts=args.position_counts,
+            full_vocab_kl=args.full_vocab_kl,
         )
         if args.detailed_results:
             report["settings"] = {
@@ -445,6 +501,7 @@ def main():
                 "position_counts": args.position_counts,
                 "position_policy": "endpoint_inclusive_integer_grid_over_valid_generated_positions",
                 "top_k": args.top_k,
+                "full_vocab_kl": args.full_vocab_kl,
                 "seed": args.seed,
                 "generation": "greedy_until_eos_or_token_cap",
                 "calibration_dataset": ptq_args.dataset,

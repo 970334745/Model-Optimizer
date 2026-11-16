@@ -6,9 +6,7 @@ The following instructions show how to evaluate the Model Optimizer quantized LL
 
 ## PyTorch KL evaluation prototype
 
-`kl_eval.py` compares an unquantized BF16 base model with a separately calibrated fake-quant copy. Evaluation defaults to the private [NVIDIA 300-prompt benchmark blend](https://huggingface.co/datasets/nvidia/balanced-benchmark-prompts-300). Supply a model and a fixed PTQ recipe; calibration reuses the `hf_ptq.py` workflow and stops before checkpoint export. Install ModelOpt and the [hf_ptq requirements](../hf_ptq/requirements.txt) as described in the [hf_ptq setup](../hf_ptq/README.md).
-
-Run from the repository root:
+`kl_eval.py` compares a BF16 model with a calibrated fake-quant copy using the [NVIDIA 300-prompt benchmark blend](https://huggingface.co/datasets/nvidia/balanced-benchmark-prompts-300). Install ModelOpt and the [hf_ptq requirements](../hf_ptq/requirements.txt), then run from the repository root:
 
 ```sh
 python examples/llm_eval/kl_eval.py \
@@ -17,29 +15,24 @@ python examples/llm_eval/kl_eval.py \
     --output kl_results.json
 ```
 
-This is a usage example, not a validated model/recipe result. The recipe includes NVFP4 weights and activations with FP8 KV-cache cast quantization. Other built-in PTQ recipe names or YAML paths can be supplied through `--recipe`.
+Defaults: 300 prompts, batches of 8, greedy generation up to 2,048 tokens or EOS. Both models score the same continuations. Conditional KL uses the BF16 model's top 1,024 vocabulary tokens at each position, normalizing both distributions over those IDs. Scores are in nats, averaged within each prompt, then equally across prompts.
 
-- Evaluation uses all 300 rows of the blend's `test` split at revision `c211674f78e43ecd5aa487b3d3539499efafce78`, in their saved order: 50 prompts each from HLE, LiveCodeBench, LongBench v2, MathArena, GPQA, and IFBench. Only each row's `messages` are passed through the model tokenizer's chat template with an assistant generation prompt; labels and difficulty metadata never enter the model. Prompts remain complete, and a prompt plus the requested continuation that exceeds the model context raises an error before calibration.
-- The BF16 model greedily generates up to 2,048 tokens per prompt, stopping at EOS. Both models then receive the identical prompt and continuation. Only the generated-token predictions, including EOS, contribute to the score.
-- Full-vocabulary KL is `KL(BF16 || fake-quant)` over all vocabulary tokens. Conditional top-k KL uses the BF16 model's top 1,024 token IDs at each position by default and separately normalizes both models over those same IDs. Override the head size with `--top_k K`; full-vocabulary KL is always computed. It excludes tail mass and is not an approximation with an `OTHER` bucket.
-- Log-softmax and KL use FP32, in chunks of 32 positions. Each reported mean first averages positions within an example, then averages the example scores equally. Units are nats. Non-finite scores raise an error rather than being dropped.
-- The JSON contains the overall `full_vocab_kl` and `conditional_topk_kl` means by default. Add `--detailed_results` to save a report with `summary`, per-example scores and token counts, prompt/continuation token IDs, dataset IDs/source/cohort ranks, and resolved recipe and run settings, including the dataset revision, fingerprint, and actual prompt lengths. Continuation logits are held for one evaluation batch and are not saved. Models exposing `logits_to_keep` project only the continuation rows during scoring; other models may materialize prompt logits too.
+- `--top_k K`: change the conditional vocabulary size.
+- `--full_vocab_kl`: also report full-vocabulary `KL(BF16 || fake-quant)`.
+- `--max_new_tokens N`, `--num_examples N`, `--eval_batch_size N`: adjust evaluation size.
+- `--detailed_results`: include per-prompt scores, token IDs, and run settings in JSON.
 
-To compare spaced scoring with the full continuation, add:
+For optional full-vocabulary KL at evenly spaced positions, including both response endpoints:
 
 ```sh
---max_new_tokens 8192 --position_counts 16 32 64 128 256 512 1024 2048 4096 8192
+--full_vocab_kl --position_counts 64 512 2048
 ```
 
-For a response with `L` valid generated tokens and requested count `K`, set `m = min(L, K)` and select zero-based positions `i * (L - 1) // (m - 1)` for `i = 0, ..., m - 1` (position zero alone when `m = 1`). This deterministic grid includes both endpoints; each count is recomputed independently, so the subsets generally are not nested. The first EOS prediction belongs to the response; padding and later tokens do not. Every selected position uses full-vocabulary KL. Results include `spaced_full_vocab_kl_K`, with equal prompt weighting, alongside the full-continuation reference. Short responses contribute every position when `K >= L`. The cap changes generation length; the position counts only change which existing positions enter each mean. This analysis reuses the full scoring pass and does not measure sparse-scoring speedups.
+This adds `spaced_full_vocab_kl_K`; responses shorter than `K` use every generated position. Position sampling reuses the complete scoring pass.
 
-Override evaluation settings with `--num_examples`, `--eval_revision`, `--eval_batch_size`, `--max_new_tokens`, `--top_k`, and `--seed`. Smaller example counts select a prefix in saved order; the seed does not reshuffle the cohort. Calibration is separate from blended-prompt evaluation and inherits `hf_ptq.py` defaults: the CNN/DailyMail + Nemotron mixture, 1,024 samples, maximum length 512, and automatic batch sizing. Override those with `--dataset`, `--calib_size`, `--calib_seq`, and `--batch_size`; these flags affect calibration only. Evaluation generates and scores batches of 8 prompts by default (`--eval_batch_size 8`), independently of calibration batch sizing. Batches are left-padded with attention masks and position IDs; generated padding and tokens after the first EOS are excluded. The last batch may be smaller. Decrease the evaluation batch size if the complete prompts exceed available memory. Validate batched scores against single-prompt scores for the chosen model, especially architectures with recurrent layers whose padding support varies by runtime.
+Calibration uses `hf_ptq.py` defaults; override with `--dataset`, `--calib_size`, `--calib_seq`, and `--batch_size`. Run `--help` for all options.
 
-Authenticate with a Hugging Face account that has read access to the NVIDIA dataset repository, using `hf auth login` or `HF_TOKEN`. NVIDIA organization membership must include repository read access; the dataset remains private. No prompt contents are bundled with this example.
-
-The default [Nemotron calibration dataset](https://huggingface.co/datasets/nvidia/Nemotron-Post-Training-Dataset-v2) is gated. Authenticate with a Hugging Face account that has access before running; if using an isolated `HF_HOME`, make the token available through `HF_TOKEN_PATH`.
-
-Run in one process with sufficient GPU memory for **two model copies**, calibration workspace, and one evaluation batch's activations and logits. The existing hf_ptq loader can place models across visible GPUs; `--gpu_max_mem_percentage` controls its budget. The initial prototype requires an unquantized BF16 checkpoint with text-only causal generation and calibration. AutoQuantize, layerwise export recipes, and distributed evaluation are excluded. `--trust_remote_code` is opt-in, and `--attn_implementation` is forwarded to the hf_ptq loader.
+Requires a text-only BF16 causal model, a fixed PTQ recipe, and GPU memory for two model copies plus calibration and scoring. Run in one process; reduce `--eval_batch_size` if needed. Authenticate with `hf auth login` or `HF_TOKEN` for access to the private evaluation blend and gated calibration datasets.
 
 ## NeMo Evaluator
 

@@ -43,7 +43,9 @@ def test_kl_direction_shared_support_and_chunk_reduction(kl_eval, chunk_size):
     q = [0.25, 0.25, 0.5]  # Candidate's favorite token is outside the reference top-2.
     reference = torch.tensor([p, p, q]).log()
     quantized = torch.tensor([q, q, q]).log()
-    actual = kl_eval.mean_kl(reference, quantized, top_k=2, chunk_size=chunk_size)
+    actual = kl_eval.mean_kl(
+        reference, quantized, top_k=2, chunk_size=chunk_size, full_vocab_kl=True
+    )
     expected_full = sum(a * math.log(a / b) for a, b in zip(p, q)) * 2 / 3
     expected_head = (0.625 * math.log(0.625 / 0.5) + 0.375 * math.log(0.375 / 0.5)) * 2 / 3
     assert actual["full_vocab_kl"] == pytest.approx(expected_full, abs=1e-6)
@@ -59,7 +61,12 @@ def test_spaced_full_kl_uses_entire_response_and_short_eos(kl_eval, chunk_size):
         [[0.5, 0.5], [0.1, 0.9], [0.2, 0.8], [0.3, 0.7], [0.4, 0.6], [0.05, 0.95]]
     ).log()
     actual = kl_eval.mean_kl(
-        reference, candidate, top_k=None, chunk_size=chunk_size, position_counts=[1, 3, 6, 8192]
+        reference,
+        candidate,
+        top_k=None,
+        chunk_size=chunk_size,
+        position_counts=[1, 3, 6, 8192],
+        full_vocab_kl=True,
     )
     per_token = (reference.exp() * (reference - candidate)).sum(-1).tolist()
     # EAR's endpoint grid for six positions and three samples is [0, 2, 5].
@@ -70,13 +77,13 @@ def test_spaced_full_kl_uses_entire_response_and_short_eos(kl_eval, chunk_size):
     assert actual["spaced_full_vocab_kl_6"] == actual["full_vocab_kl"]
     assert actual["spaced_full_vocab_kl_8192"] == actual["full_vocab_kl"]
     with pytest.raises(ValueError):
-        kl_eval.mean_kl(reference, candidate, position_counts=[0], top_k=None)
+        kl_eval.mean_kl(reference, candidate, position_counts=[0], top_k=None, full_vocab_kl=True)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_identical_logits_have_zero_kl(kl_eval, dtype):
     logits = torch.tensor([[1, 2, -3], [8, 4, 1]], dtype=dtype)
-    metrics = kl_eval.mean_kl(logits, logits.clone(), top_k=2)
+    metrics = kl_eval.mean_kl(logits, logits.clone(), top_k=2, full_vocab_kl=True)
     assert metrics == pytest.approx({"full_vocab_kl": 0, "conditional_topk_kl": 0}, abs=1e-7)
 
 
@@ -109,20 +116,27 @@ def test_scores_all_and_only_continuation_predictions(kl_eval):
         q = quantized(sequence[:, :-1], use_cache=False).logits[0].float().softmax(-1)
         expected = (p[2:] * (p[2:].log() - q[2:].log())).sum(-1).mean().item()
     assert expected > 1e-6
-    actual = kl_eval.score_continuation(reference, quantized, sequence, prompt_tokens=3, top_k=4)
+    actual = kl_eval.score_continuation(
+        reference, quantized, sequence, prompt_tokens=3, top_k=4, full_vocab_kl=True
+    )
     assert actual["full_vocab_kl"] == pytest.approx(expected, abs=1e-6)
 
 
 @pytest.mark.parametrize("detailed_results", [False, True])
-@pytest.mark.parametrize("top_k", [None, 4])
-def test_real_generation_stops_at_eos_and_scores_it(kl_eval, monkeypatch, detailed_results, top_k):
+@pytest.mark.parametrize(("top_k", "full_vocab_kl"), [(4, False), (None, True), (4, True)])
+def test_real_generation_stops_at_eos_and_scores_it(
+    kl_eval, monkeypatch, detailed_results, top_k, full_vocab_kl
+):
     argv = ["kl_eval.py", "--model", "local-test-model", "--recipe", "local-test-recipe"]
     if top_k is not None:
         argv.extend(["--top_k", str(top_k)])
+    if full_vocab_kl:
+        argv.append("--full_vocab_kl")
     if detailed_results:
         argv.append("--detailed_results")
     monkeypatch.setattr(sys, "argv", argv)
     args = kl_eval._parse_args()
+    assert args.full_vocab_kl == full_vocab_kl
     assert args.eval_batch_size == 8
     assert args.max_new_tokens == 2048
     assert args.top_k == (1024 if top_k is None else top_k)
@@ -148,11 +162,15 @@ def test_real_generation_stops_at_eos_and_scores_it(kl_eval, monkeypatch, detail
         max_new_tokens=4,
         top_k=top_k,
         detailed_results=args.detailed_results,
-        position_counts=[1, 64, 64],
+        position_counts=[1, 64, 64] if full_vocab_kl else [],
+        full_vocab_kl=args.full_vocab_kl,
     )
     assert reference.generation_config == original_generation
-    expected = {"full_vocab_kl": 0}
-    expected.update({"spaced_full_vocab_kl_1": 0, "spaced_full_vocab_kl_64": 0})
+    expected = {}
+    if full_vocab_kl:
+        expected.update(
+            {"full_vocab_kl": 0, "spaced_full_vocab_kl_1": 0, "spaced_full_vocab_kl_64": 0}
+        )
     if top_k is not None:
         expected["conditional_topk_kl"] = 0
     if detailed_results:
@@ -234,7 +252,7 @@ def test_full_vocab_only_skips_topk(kl_eval, monkeypatch):
 
     monkeypatch.setattr(torch.Tensor, "topk", unexpected_topk)
     logits = torch.randn(3, 16)
-    result = kl_eval.mean_kl(logits, logits.clone(), top_k=None)
+    result = kl_eval.mean_kl(logits, logits.clone(), top_k=None, full_vocab_kl=True)
     assert result == pytest.approx({"full_vocab_kl": 0}, abs=1e-7)
 
 
@@ -247,14 +265,16 @@ def test_batched_scoring_excludes_padding_and_matches_single_rows(kl_eval, top_k
     sequences = [[4, 5, 6, 7, 8], [4, 5, 0], [4, 5, 6, 7, 8, 9]]
     lengths = [3, 2, 2]
     counts = [1, 3, 8192]
-    actual = kl_eval._score_batch(reference, quantized, sequences, lengths, 0, top_k, counts)
+    actual = kl_eval._score_batch(
+        reference, quantized, sequences, lengths, 0, top_k, counts, full_vocab_kl=True
+    )
     for sequence, prompt_length, metrics in zip(sequences, lengths, actual):
         # Independent unpadded forwards verify alignment, EOS inclusion, and per-row means.
         inputs = torch.tensor([sequence[:-1]])
         with torch.inference_mode():
             p = reference(inputs, use_cache=False).logits[0, prompt_length - 1 :]
             q = quantized(inputs, use_cache=False).logits[0, prompt_length - 1 :]
-        expected = kl_eval.mean_kl(p, q, top_k, position_counts=counts)
+        expected = kl_eval.mean_kl(p, q, top_k, position_counts=counts, full_vocab_kl=True)
         assert metrics == pytest.approx(expected, abs=1e-6)
 
 
@@ -309,13 +329,16 @@ def test_generation_and_scoring_use_eight_rows_then_partial_batch(kl_eval):
     assert batched["summary"] == pytest.approx(singles["summary"], abs=1e-6)
     for actual, expected in zip(batched["examples"], singles["examples"]):
         assert actual["generated_ids"] == expected["generated_ids"] == [0]
-        assert actual["full_vocab_kl"] == pytest.approx(expected["full_vocab_kl"], abs=1e-6)
+        assert actual["conditional_topk_kl"] == pytest.approx(
+            expected["conditional_topk_kl"], abs=1e-6
+        )
 
 
-def test_default_conditional_kl_uses_1024_tokens(kl_eval):
+@pytest.mark.parametrize("full_vocab_kl", [False, True])
+def test_default_conditional_kl_uses_1024_tokens(kl_eval, full_vocab_kl):
     reference = torch.tensor([[0.0] * 1024 + [-10.0]])
     candidate = torch.tensor([[0.0] * 512 + [math.log(2)] * 512 + [8.0]])
-    actual = kl_eval.mean_kl(reference, candidate)
+    actual = kl_eval.mean_kl(reference, candidate, full_vocab_kl=full_vocab_kl)
     p_normalizer = 1024 + math.exp(-10)
     q_normalizer = 1536 + math.exp(8)
     p = 1 / p_normalizer
@@ -326,6 +349,31 @@ def test_default_conditional_kl_uses_1024_tokens(kl_eval):
         + p_tail * math.log(p_tail / (math.exp(8) / q_normalizer))
     )
     expected_head = 0.5 * math.log(1.5) + 0.5 * math.log(0.75)
-    assert actual == pytest.approx(
-        {"full_vocab_kl": expected_full, "conditional_topk_kl": expected_head}, abs=1e-6
-    )
+    expected = {"conditional_topk_kl": expected_head}
+    if full_vocab_kl:
+        expected["full_vocab_kl"] = expected_full
+    assert actual == pytest.approx(expected, abs=1e-6)
+    if not full_vocab_kl:
+        # An unused tail must not enter the conditional normalization or KL reduction.
+        candidate[0, -1] = float("nan")
+        assert kl_eval.mean_kl(reference, candidate) == pytest.approx(expected, abs=1e-6)
+
+
+def test_position_counts_require_full_vocab_opt_in(kl_eval, monkeypatch):
+    argv = ["kl_eval.py", "--model", "fixture", "--recipe", "fixture"]
+    monkeypatch.setattr(sys, "argv", argv)
+    args = kl_eval._parse_args()
+    assert args.max_new_tokens == 2048
+    assert args.top_k == 1024
+    assert not args.full_vocab_kl
+    monkeypatch.setattr(sys, "argv", [*argv, "--position_counts", "2"])
+    with pytest.raises(SystemExit):
+        kl_eval._parse_args()
+    monkeypatch.setattr(sys, "argv", [*argv, "--position_counts", "2", "--full_vocab_kl"])
+    assert kl_eval._parse_args().position_counts == [2]
+    logits = torch.zeros(3, 4)
+    for kwargs in ({"position_counts": [2], "top_k": 2}, {"top_k": None}):
+        with pytest.raises(ValueError):
+            kl_eval.mean_kl(logits, logits, **kwargs)
+        with pytest.raises(ValueError):
+            kl_eval.evaluate(None, None, None, [{"input_ids": [1]}], **kwargs)
