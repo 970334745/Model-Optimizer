@@ -10,7 +10,7 @@ Changelog
 
 *Quantization - Algorithms*
 
-- Add ``context`` to KL-divergence AutoQuantize (``method={"method": "kl_div", "context": "lowest"}``, or ``method_options: {context: lowest}`` in a recipe): each candidate is scored with every other searched layer at its lowest-bit format (an int picks the format by its 0-based index from the lowest), so low-bit budgets go to the layers whose error compounds most once the whole model is quantized. Use the context format closest to the target budget.
+- Add ``context`` to KL-divergence AutoQuantize (``method={"method": "kl_div", "context": "lowest"}``, or ``method_options: {context: lowest}`` in a recipe): each candidate is scored with every other searched layer at its lowest-bit format (an int picks the format by its 0-based index from the lowest), so low-bit budgets go to the layers whose error compounds most once the whole model is quantized. ``"lowest"`` is a good default; a context nearer the target budget measured the same in our tests.
 
 *Quantization - QAT / QAD*
 
