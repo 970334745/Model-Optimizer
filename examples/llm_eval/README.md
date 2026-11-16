@@ -28,7 +28,7 @@ For optional full-vocabulary KL at evenly spaced positions, including both respo
 --full_vocab_kl --position_counts 64 512 2048
 ```
 
-This adds `spaced_full_vocab_kl_K`; responses shorter than `K` use every generated position. Position sampling reuses the complete scoring pass.
+This adds `spaced_full_vocab_kl_K`; responses shorter than `K` use every generated position.
 
 Calibration uses `hf_ptq.py` defaults; override with `--dataset`, `--calib_size`, `--calib_seq`, and `--batch_size`. Run `--help` for all options.
 

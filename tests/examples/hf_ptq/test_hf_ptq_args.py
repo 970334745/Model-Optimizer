@@ -1171,4 +1171,8 @@ def test_calibration_retains_live_model_without_export(monkeypatch, tmp_path):
     assert result is model
     assert hf_ptq.is_quantized(result)
     assert result.model.layers[0].mlp.down_proj.input_quantizer.amax is not None
+    with torch.inference_mode():
+        logits = result(**batch).logits
+    assert logits.shape == (*batch["input_ids"].shape, model.config.vocab_size)
+    assert torch.isfinite(logits).all()
     assert not export_path.exists()

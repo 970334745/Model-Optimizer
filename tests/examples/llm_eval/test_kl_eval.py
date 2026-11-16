@@ -105,21 +105,50 @@ def _tiny_model():
     ).eval()
 
 
-def test_scores_all_and_only_continuation_predictions(kl_eval):
+@pytest.mark.parametrize(("eos_token_id", "end"), [(None, 7), (0, 6), ([0, 8], 5)])
+def test_scores_all_and_only_continuation_predictions(kl_eval, eos_token_id, end):
+    torch.manual_seed(0)
     reference = _tiny_model()
+    reference.generation_config.eos_token_id = eos_token_id
     quantized = copy.deepcopy(reference)
     with torch.no_grad():
-        quantized.lm_head.weight[3, 0].add_(3)
-    sequence = torch.tensor([[4, 5, 6, 7, 8]])
+        quantized.lm_head.weight[:, 0].add_(torch.linspace(-3, 3, reference.config.vocab_size))
+    # EOS in the prompt is ignored; scalar/list EOS settings stop at different positions.
+    sequence = torch.tensor([[0, 5, 6, 7, 8, 0, 0]])
     with torch.inference_mode():
-        p = reference(sequence[:, :-1], use_cache=False).logits[0].float().softmax(-1)
-        q = quantized(sequence[:, :-1], use_cache=False).logits[0].float().softmax(-1)
-        expected = (p[2:] * (p[2:].log() - q[2:].log())).sum(-1).mean().item()
+        p = reference(sequence[:, :-1], use_cache=False).logits[0, 2 : end - 1].float()
+        q = quantized(sequence[:, :-1], use_cache=False).logits[0, 2 : end - 1].float()
+        per_position = (p.softmax(-1) * (p.log_softmax(-1) - q.log_softmax(-1))).sum(-1)
+        expected = per_position.mean().item()
+        ids = p.topk(4, dim=-1).indices
+        p_head, q_head = p.gather(-1, ids), q.gather(-1, ids)
+        expected_head = (
+            (p_head.softmax(-1) * (p_head.log_softmax(-1) - q_head.log_softmax(-1)))
+            .sum(-1)
+            .mean()
+            .item()
+        )
     assert expected > 1e-6
+    assert expected_head > 1e-6
     actual = kl_eval.score_continuation(
-        reference, quantized, sequence, prompt_tokens=3, top_k=4, full_vocab_kl=True
+        reference,
+        quantized,
+        sequence,
+        prompt_tokens=3,
+        top_k=4,
+        full_vocab_kl=True,
+        position_counts=[1, 2, 64],
     )
-    assert actual["full_vocab_kl"] == pytest.approx(expected, abs=1e-6)
+    assert actual == pytest.approx(
+        {
+            "full_vocab_kl": expected,
+            "conditional_topk_kl": expected_head,
+            "spaced_full_vocab_kl_1": per_position[0].item(),
+            "spaced_full_vocab_kl_2": (per_position[0].item() + per_position[-1].item()) / 2,
+            "spaced_full_vocab_kl_64": expected,
+        },
+        abs=1e-6,
+    )
 
 
 @pytest.mark.parametrize("detailed_results", [False, True])

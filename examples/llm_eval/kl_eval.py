@@ -166,15 +166,22 @@ def score_continuation(
     position_counts=(),
     full_vocab_kl=False,
 ):
-    """Score only continuation predictions, including the first generated token and EOS."""
+    """Score through the first continuation EOS; histories without EOS must be unpadded."""
     if token_ids.ndim != 2 or token_ids.shape[0] != 1:
         raise ValueError("Expected one prompt and its continuation.")
     if not 0 < prompt_tokens < token_ids.shape[1]:
         raise ValueError("Require a nonempty prompt and continuation.")
+    sequence = token_ids[0].cpu().tolist()
+    eos = reference.generation_config.eos_token_id
+    eos_ids = set(eos if isinstance(eos, list) else ([] if eos is None else [eos]))
+    end = next(
+        (i + 1 for i in range(prompt_tokens, len(sequence)) if sequence[i] in eos_ids),
+        len(sequence),
+    )
     return _score_batch(
         reference,
         quantized,
-        token_ids.cpu().tolist(),
+        [sequence[:end]],
         [prompt_tokens],
         0,
         top_k,
