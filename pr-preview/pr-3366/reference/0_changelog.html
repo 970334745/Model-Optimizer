@@ -2,7 +2,7 @@
 <html lang="en" data-accent-color="green" data-content_root="../">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Changelog - Model Optimizer 0.0.1.dev1+gfed610759</title><link rel="index" title="Index" href="../genindex.html" /><link rel="search" title="Search" href="../search.html" /><link rel="next" title="modelopt API" href="1_modelopt_api.html" /><link rel="prev" title="All GitHub Examples" href="../examples/0_all_examples.html" /><script>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Changelog - Model Optimizer 0.0.1.dev1+g5f6b90611</title><link rel="index" title="Index" href="../genindex.html" /><link rel="search" title="Search" href="../search.html" /><link rel="next" title="modelopt API" href="1_modelopt_api.html" /><link rel="prev" title="All GitHub Examples" href="../examples/0_all_examples.html" /><script>
     function setColorMode(t){let e=document.documentElement;e.setAttribute("data-color-mode",t);let a=window.matchMedia&&window.matchMedia("(prefers-color-scheme: dark)").matches,s=t;"auto"===t&&(s=a?"dark":"light"),"light"===s?(e.classList.remove("dark"),e.classList.add("light")):(e.classList.remove("light"),e.classList.add("dark"))}
     setColorMode(localStorage._theme||"auto");
   </script><link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=e1a1ceaf" />
@@ -652,6 +652,7 @@ AutoQuantize path and preserve their linear-attention fusion groups during mixed
 <li><p>Fix ONNX quantization with the default <code class="docutils literal notranslate"><span class="pre">concat_elimination</span></code> pass crashing in calibration with <code class="docutils literal notranslate"><span class="pre">KeyError:</span> <span class="pre">'&lt;tensor&gt;_ReduceMin'</span></code> when a <code class="docutils literal notranslate"><span class="pre">Concat</span></code> input is a constant, such as the class token of a ViT.</p></li>
 <li><p>Fix ONNX INT4 quantization ending the Python process when the INT4 packing extension fails to build, for example without a C++ compiler. It now falls back to the Python implementation.</p></li>
 <li><p>Fix the column-major <code class="docutils literal notranslate"><span class="pre">DequantizeLinear</span></code> surgery leaving a negative or default <code class="docutils literal notranslate"><span class="pre">axis</span></code> attribute unchanged while transposing the weight it refers to, which changed the model’s output. Re-run the surgery on affected models.</p></li>
+<li><p>Fix BF16-to-FP8 ONNX export with <code class="docutils literal notranslate"><span class="pre">ml_dtypes</span></code> 0.7.0 producing NaN FP8 weights for very small convolution weights.</p></li>
 </ul>
 <p><em>Speculative Decoding</em></p>
 <ul class="simple">
